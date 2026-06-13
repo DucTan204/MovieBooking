@@ -38,13 +38,19 @@ public class PaymentService {
     @Autowired
     private PayOS payOS;
 
+    // Các biến này sẽ lấy từ Environment Variables trên Render hoặc application.properties
     @Value("${payos.return-url}")
     private String returnUrl;
 
     @Value("${payos.cancel-url}")
     private String cancelUrl;
 
-    // ✅ FIX LỖI: Bổ sung lại hàm process cho Controller gọi
+    @Value("${payos.webhook-url}")
+    private String webhookUrl;
+
+    /**
+     * Khởi tạo bản ghi thanh toán trong Database
+     */
     @Transactional
     public Payment process(Payment request) {
         Long bookingId = request.getBooking().getId();
@@ -62,6 +68,9 @@ public class PaymentService {
         return paymentRepository.save(request);
     }
 
+    /**
+     * Tạo link thanh toán PayOS
+     */
     @Transactional
     public PayOSResponse createPayOSPayment(Long bookingId) {
         Booking booking = bookingRepository.findById(bookingId)
@@ -71,6 +80,7 @@ public class PaymentService {
             return PayOSResponse.builder().status("PAID").build();
         }
 
+        // Tạo orderCode ngẫu nhiên (PayOS yêu cầu kiểu số)
         long orderCode = Long.parseLong(String.valueOf(System.currentTimeMillis()).substring(3, 13)) + bookingId;
 
         PaymentLinkItem item = PaymentLinkItem.builder()
@@ -79,9 +89,10 @@ public class PaymentService {
                 .price(booking.getTotalPrice().longValue())
                 .build();
 
-        // Xóa dấu "-" khi gửi sang PayOS
+        // PayOS description không cho phép ký tự đặc biệt như "-"
         String descriptionForPayOS = booking.getBookingCode().replace("-", "");
 
+        // Build request gửi sang PayOS
         CreatePaymentLinkRequest paymentData = CreatePaymentLinkRequest.builder()
                 .orderCode(orderCode)
                 .amount(booking.getTotalPrice().longValue())
@@ -89,12 +100,14 @@ public class PaymentService {
                 .items(List.of(item))
                 .returnUrl(returnUrl + "?bookingId=" + bookingId)
                 .cancelUrl(cancelUrl + "?bookingId=" + bookingId)
+           
                 .build();
 
         try {
+            log.info("Đang tạo link thanh toán với Webhook: {}", webhookUrl);
             CreatePaymentLinkResponse response = payOS.paymentRequests().create(paymentData);
 
-            // Lưu thông tin payment vào DB
+            // Lưu thông tin payment vào DB để đối soát
             Payment payment = new Payment();
             payment.setBooking(booking);
             payment.setAmount(booking.getTotalPrice());
@@ -111,46 +124,66 @@ public class PaymentService {
                     .status("PENDING")
                     .build();
         } catch (PayOSException e) {
+            log.error("Lỗi PayOS: {}", e.getMessage());
             throw new RuntimeException("Lỗi tạo PayOS link: " + e.getMessage());
         }
     }
 
+    /**
+     * Xử lý dữ liệu từ Webhook gửi về
+     */
     @Transactional
     public void handleWebhook(String webhookBody) {
         try {
+            // Xác thực chữ ký dữ liệu từ PayOS gửi về để đảm bảo an toàn
             WebhookData data = payOS.webhooks().verify(webhookBody);
-            String bookingCode = data.getDescription();
+
+            // Description lúc này là mã Booking (không có dấu -)
+            String bookingCodeFromWebhook = data.getDescription();
+
+            // "00" nghĩa là thanh toán thành công
             if ("00".equals(data.getCode())) {
-                confirmPayment(bookingCode);
+                log.info("Thanh toán thành công qua Webhook cho mã: {}", bookingCodeFromWebhook);
+                confirmPayment(bookingCodeFromWebhook);
             }
         } catch (Exception e) {
-            log.error("Webhook error: {}", e.getMessage());
+            log.error("Xác thực Webhook thất bại: {}", e.getMessage());
         }
     }
 
+    /**
+     * Cập nhật trạng thái Booking và tạo vé QR
+     */
     @Transactional
     public void confirmPayment(String bookingCode) {
-        // ✅ FIX LỖI: Xử lý biến final cho Lambda
         String tempCode = bookingCode;
+
+        // Khôi phục lại định dạng mã BK-XXXX nếu PayOS làm mất dấu gạch ngang
         if (!tempCode.contains("-") && tempCode.startsWith("BK") && tempCode.length() > 2) {
             tempCode = "BK-" + tempCode.substring(2);
         }
+
         final String finalBookingCode = tempCode;
 
         Booking booking = bookingRepository.findByBookingCode(finalBookingCode)
                 .orElseThrow(() -> new NotFoundException("Mã vé không tồn tại: " + finalBookingCode));
 
+        // Nếu đã thanh toán rồi thì không xử lý lại
         if (booking.getStatus() == Booking.BookingStatus.PAID) return;
 
+        // 1. Cập nhật trạng thái Booking
         booking.setStatus(Booking.BookingStatus.PAID);
         bookingRepository.save(booking);
 
+        // 2. Tạo mã QR vé
         try {
             ticketQRService.generateQRForBooking(booking.getId());
+            log.info("Đã tạo vé QR cho Booking ID: {}", booking.getId());
         } catch (Exception e) {
-            log.warn("QR Error: {}", e.getMessage());
+            log.error("Lỗi tạo QR: {}", e.getMessage());
         }
 
+        // 3. Cập nhật trạng thái Payment sang SUCCESS
         paymentRepository.findByBookingId(booking.getId()).ifPresent(p -> {
             p.setStatus(Payment.PaymentStatus.SUCCESS);
             paymentRepository.save(p);
@@ -159,7 +192,7 @@ public class PaymentService {
 
     public String checkPaymentStatus(Long bookingId) {
         Booking booking = bookingRepository.findById(bookingId)
-                .orElseThrow(() -> new NotFoundException("Not found"));
+                .orElseThrow(() -> new NotFoundException("Không tìm thấy đơn hàng"));
         return booking.getStatus() == Booking.BookingStatus.PAID ? "PAID" : "PENDING";
     }
 
