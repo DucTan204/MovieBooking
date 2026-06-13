@@ -1,13 +1,14 @@
-# Sử dụng hình ảnh Java 17 gọn nhẹ
-FROM openjdk:17-jdk-slim AS build
+# Bước 1: Build dự án bằng JDK 17 của Eclipse Temurin
+FROM eclipse-temurin:17-jdk AS build
 WORKDIR /app
 COPY . .
-# Cấp quyền và chạy build bằng wrapper có sẵn trong dự án của bạn
+# Cấp quyền và chạy build
 RUN chmod +x mvnw && ./mvnw clean package -DskipTests
 
-FROM openjdk:17-jdk-slim
+# Bước 2: Chạy ứng dụng bằng JRE (nhẹ hơn JDK, giúp tiết kiệm RAM cho Render)
+FROM eclipse-temurin:17-jre
 WORKDIR /app
-# Copy file jar được build ra (Render sẽ tự tìm file .jar trong target)
+# Copy file jar từ bước build sang
 COPY --from=build /app/target/*.jar app.jar
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
